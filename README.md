@@ -9,7 +9,7 @@
 
 ---
 
-## 📌 Neden İnternetteki Diğer Yamalar Çalışmıyor?
+## 📌 Diğer yamalardan farkı ne?
 
 Oyun için internette dolaşan eski Türkçe yamaların güncel Steam sürümünde çalışmamasının ve oyunu çökertmesinin temel teknik nedenleri:
 1. **SDBM Hash & İkili Arama (Binary Search) Algoritması:** Oyun motoru (Neocore Games), dil arşivindeki (`.N2PK`) dosya tablosunu `SDBM` algoritması ile hash'ler ve çalışma zamanında dosyaları **sıralı ikili arama** ile bulur. Eski yamalar bu sıralamayı bozduğu için oyun motoru dil dosyalarını bulamaz ve çöker.
