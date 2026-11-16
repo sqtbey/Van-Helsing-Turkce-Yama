@@ -1,23 +1,27 @@
 """
-Van Helsing N2PK Tool
-Neocore Package format:
-  - Header: uint32(nameLen) + UTF-16 string "Neocore Package"
-  - uint16 padding
-  - uint32 unknown (version/flags)
-  - uint32 file_count
-  - uint16 padding
-  - DATA: concatenated file bytes (offset 44)
-  - FILE TABLE (at end): sorted by SDBM hash of filename:
-      uint32 sdbm_hash + uint32 nameLen + UTF-16 name + uint16(0) + int64 offset + int64 size
+Van Helsing N2PK Tool - Exact Specification
+Neocore Package binary format:
+  Offset 0..3: uint32 name_len (15)
+  Offset 4..33: UTF-16 LE string "Neocore Package" (30 bytes)
+  Offset 34..35: uint16 null terminator (0)
+  Offset 36..43: int64 data_size (length of data section in bytes)
+  Offset 44..(44 + data_size - 1): concatenated file data
+  Offset (44 + data_size)..(44 + data_size + 3): uint32 file_count (number of files)
+  Offset (44 + data_size + 4)..(EOF): file table entries, sorted by SDBM hash in ascending order:
+      uint32 sdbm_hash
+      uint32 filename_len
+      UTF-16 LE filename (filename_len * 2 bytes)
+      uint16 null terminator (0)
+      int64 data_offset (relative to offset 44)
+      int64 data_size (length of this file in bytes)
 """
 
 import struct
 import os
 import sys
-import re
 
 HEADER_MAGIC = "Neocore Package"
-DATA_OFFSET = 44
+DATA_START_OFFSET = 44
 
 
 def sdbm(s):
@@ -35,147 +39,128 @@ def extract_n2pk(filepath, output_dir):
     with open(filepath, 'rb') as f:
         data = f.read()
 
-    # Parse header
     name_len = struct.unpack_from('<I', data, 0)[0]
     magic = data[4:4 + name_len * 2].decode('utf-16-le')
     assert magic == HEADER_MAGIC, f"Invalid N2PK header: {magic}"
 
-    content_bytes = data[DATA_OFFSET:]
-    xml_offsets = [m.start() for m in re.finditer(rb'<\?xml version="1\.0"', content_bytes)]
-    actual_count = len(xml_offsets)
+    data_size = struct.unpack_from('<q', data, 36)[0]
+    data_start = DATA_START_OFFSET
+    data_end = data_start + data_size
+
+    file_count = struct.unpack_from('<I', data, data_end)[0]
+    table_pos = data_end + 4
 
     entries = []
-    pos = len(data)
+    for _ in range(file_count):
+        h = struct.unpack_from('<I', data, table_pos)[0]
+        nl = struct.unpack_from('<I', data, table_pos + 4)[0]
+        name = data[table_pos + 8: table_pos + 8 + nl * 2].decode('utf-16-le')
+        next_pos = table_pos + 8 + nl * 2 + 2  # skip null term
+        offset = struct.unpack_from('<q', data, next_pos)[0]
+        size = struct.unpack_from('<q', data, next_pos + 8)[0]
+        table_pos = next_pos + 16
 
-    for _ in range(actual_count):
-        size = struct.unpack_from('<q', data, pos - 8)[0]
-        offset = struct.unpack_from('<q', data, pos - 16)[0]
-        pos -= 18
+        entries.append({
+            'hash': h,
+            'name': name,
+            'offset': offset,
+            'size': size
+        })
 
-        for test_len in range(5, 70):
-            nl_pos = pos - test_len * 2 - 4
-            if nl_pos < DATA_OFFSET:
-                continue
-            test_nl = struct.unpack_from('<I', data, nl_pos)[0]
-            if test_nl == test_len:
-                name_bytes = data[nl_pos + 4: nl_pos + 4 + test_len * 2]
-                try:
-                    name = name_bytes.decode('utf-16-le')
-                    if name.endswith('.xml') or name.endswith('.cfg'):
-                        h_pos = nl_pos - 4
-                        h = struct.unpack_from('<I', data, h_pos)[0]
-                        entries.append({
-                            'name': name,
-                            'offset': offset,
-                            'size': size,
-                            'checksum': h
-                        })
-                        pos = h_pos
-                        break
-                except Exception:
-                    continue
+        file_bytes = data[data_start + offset: data_start + offset + size]
+        out_path = os.path.join(output_dir, name)
+        with open(out_path, 'wb') as out_f:
+            out_f.write(file_bytes)
 
-    entries.reverse()
-
-    for entry in entries:
-        xml_data = data[DATA_OFFSET + entry['offset']: DATA_OFFSET + entry['offset'] + entry['size']]
-        out_path = os.path.join(output_dir, entry['name'])
-        with open(out_path, 'wb') as f:
-            f.write(xml_data)
-
+    print(f"Extracted {len(entries)} files from {filepath} to {output_dir}")
     return entries
 
 
-def pack_n2pk(xml_dir, output_filepath, original_filepath):
-    """Pack directory of XML files back into N2PK with SDBM-sorted file table."""
-    with open(original_filepath, 'rb') as f:
+def pack_n2pk(xml_dir, output_filepath, template_n2pk_path):
+    """
+    Pack directory of XML files back into N2PK with:
+      1. Correct int64 data_size at offset 36.
+      2. Correct uint32 file_count at offset (44 + data_size).
+      3. File table entries sorted by SDBM hash.
+    """
+    # Extract template to get complete list of required filenames
+    with open(template_n2pk_path, 'rb') as f:
         orig_data = f.read()
 
-    # Get original entries to know file names
-    content_bytes = orig_data[DATA_OFFSET:]
-    xml_offsets = [m.start() for m in re.finditer(rb'<\?xml version="1\.0"', content_bytes)]
-    actual_count = len(xml_offsets)
+    name_len = struct.unpack_from('<I', orig_data, 0)[0]
+    orig_data_size = struct.unpack_from('<q', orig_data, 36)[0]
+    orig_data_end = DATA_START_OFFSET + orig_data_size
+    orig_file_count = struct.unpack_from('<I', orig_data, orig_data_end)[0]
 
-    orig_entries = []
-    pos = len(orig_data)
-    for _ in range(actual_count):
-        size = struct.unpack_from('<q', orig_data, pos - 8)[0]
-        offset = struct.unpack_from('<q', orig_data, pos - 16)[0]
-        pos -= 18
-
-        for test_len in range(5, 70):
-            nl_pos = pos - test_len * 2 - 4
-            if nl_pos < DATA_OFFSET:
-                continue
-            test_nl = struct.unpack_from('<I', orig_data, nl_pos)[0]
-            if test_nl == test_len:
-                name_bytes = orig_data[nl_pos + 4: nl_pos + 4 + test_len * 2]
-                try:
-                    name = name_bytes.decode('utf-16-le')
-                    if name.endswith('.xml') or name.endswith('.cfg'):
-                        orig_entries.append({
-                            'name': name,
-                            'orig_offset': offset,
-                            'orig_size': size
-                        })
-                        pos = nl_pos - 4
-                        break
-                except Exception:
-                    continue
-
-    orig_entries.reverse()
-
+    table_pos = orig_data_end + 4
     files_to_pack = []
-    for entry in orig_entries:
-        p = os.path.join(xml_dir, entry['name'])
+
+    for _ in range(orig_file_count):
+        nl = struct.unpack_from('<I', orig_data, table_pos + 4)[0]
+        name = orig_data[table_pos + 8: table_pos + 8 + nl * 2].decode('utf-16-le')
+        next_pos = table_pos + 8 + nl * 2 + 2
+        orig_offset = struct.unpack_from('<q', orig_data, next_pos)[0]
+        orig_size = struct.unpack_from('<q', orig_data, next_pos + 8)[0]
+        table_pos = next_pos + 16
+
+        p = os.path.join(xml_dir, name)
         if os.path.exists(p):
             with open(p, 'rb') as f:
                 fdata = f.read()
         else:
-            fdata = orig_data[DATA_OFFSET + entry['orig_offset']:
-                              DATA_OFFSET + entry['orig_offset'] + entry['orig_size']]
+            fdata = orig_data[DATA_START_OFFSET + orig_offset: DATA_START_OFFSET + orig_offset + orig_size]
 
         files_to_pack.append({
-            'name': entry['name'],
+            'name': name,
             'data': fdata,
-            'sdbm': sdbm(entry['name'])
+            'sdbm': sdbm(name)
         })
 
-    # Sort files by SDBM hash in ascending order (Neocore engine requirement)
+    # Sort files by SDBM hash in ascending order (Neocore engine requirement for binary search)
     files_to_pack.sort(key=lambda x: x['sdbm'])
 
-    new_data = b''
-    new_table = b''
-    current_offset = 0
+    # Build data section
+    data_section = b''
+    for item in files_to_pack:
+        item['offset'] = len(data_section)
+        data_section += item['data']
+
+    new_data_size = len(data_section)
+
+    # Build header (44 bytes)
+    magic_bytes = HEADER_MAGIC.encode('utf-16-le')
+    header = struct.pack('<I', len(HEADER_MAGIC))
+    header += magic_bytes
+    header += struct.pack('<H', 0)  # null terminator
+    header += struct.pack('<q', new_data_size)  # int64 data_size!
+
+    assert len(header) == DATA_START_OFFSET, f"Header size is {len(header)}, expected {DATA_START_OFFSET}"
+
+    # Build file table
+    table_section = struct.pack('<I', len(files_to_pack))  # uint32 file_count!
 
     for item in files_to_pack:
-        fdata = item['data']
         name = item['name']
-        h = item['sdbm']
-
         name_encoded = name.encode('utf-16-le')
-        name_len = len(name)
+        entry = struct.pack('<I', item['sdbm'])
+        entry += struct.pack('<I', len(name))
+        entry += name_encoded
+        entry += struct.pack('<H', 0)  # null terminator
+        entry += struct.pack('<q', item['offset'])
+        entry += struct.pack('<q', len(item['data']))
+        table_section += entry
 
-        entry_bytes = struct.pack('<I', h)
-        entry_bytes += struct.pack('<I', name_len)
-        entry_bytes += name_encoded
-        entry_bytes += b'\x00\x00'
-        entry_bytes += struct.pack('<q', current_offset)
-        entry_bytes += struct.pack('<q', len(fdata))
-
-        new_data += fdata
-        new_table += entry_bytes
-        current_offset += len(fdata)
-
-    header = orig_data[:DATA_OFFSET]
-    output = header + new_data + new_table
+    complete_file = header + data_section + table_section
 
     os.makedirs(os.path.dirname(os.path.abspath(output_filepath)), exist_ok=True)
     with open(output_filepath, 'wb') as f:
-        f.write(output)
+        f.write(complete_file)
 
     print(f"Packed {len(files_to_pack)} files into {output_filepath}")
-    print(f"Data size: {len(new_data):,}, Table size: {len(new_table):,}, Total size: {len(output):,}")
+    print(f"  Header size: {len(header)}")
+    print(f"  Data size:   {new_data_size:,} bytes")
+    print(f"  Table size:  {len(table_section):,} bytes")
+    print(f"  Total size:  {len(complete_file):,} bytes")
     return len(files_to_pack)
 
 
@@ -183,7 +168,7 @@ if __name__ == '__main__':
     if len(sys.argv) < 3:
         print("Usage:")
         print("  n2pk_tool.py extract <input.N2PK> <output_dir>")
-        print("  n2pk_tool.py pack <xml_dir> <output.N2PK> <orig.N2PK>")
+        print("  n2pk_tool.py pack <xml_dir> <output.N2PK> <template.N2PK>")
         sys.exit(1)
 
     if sys.argv[1] == 'extract':
